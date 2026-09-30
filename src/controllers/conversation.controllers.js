@@ -4,12 +4,16 @@ import Conversation from "../models/conversation.models.js";
 import Message from "../models/message.models.js";
 
 /**
- * Initializes GoogleGenAI client using server environment variable
+ * Initializes GoogleGenAI client using server environment variable or user-provided key
  */
-const getAIClient = () => {
-  const apiKey = process.env.GOOGLE_API_KEY || process.env.GOOGEL_API_KEY;
+const getAIClient = (customKey) => {
+  const apiKey =
+    customKey ||
+    process.env.GOOGLE_API_KEY ||
+    process.env.GOOGEL_API_KEY ||
+    process.env.GEMINI_API_KEY;
   if (!apiKey) {
-    throw new Error("GOOGLE_API_KEY is not configured on the server");
+    throw new Error("GOOGLE_API_KEY is not configured on the server or provided in request");
   }
   return new GoogleGenAI({ apiKey });
 };
@@ -61,7 +65,7 @@ const extractErrorMessage = (error) => {
 /**
  * Stream AI Chat for a Conversation via Server-Sent Events (SSE)
  * POST /api/conversations/stream
- * Body: { conversationId?: string, prompt?: string, imageUrl?: string, model?: string, systemInstruction?: string }
+ * Body: { conversationId?: string, prompt?: string, imageUrl?: string, model?: string, systemInstruction?: string, apiKey?: string }
  */
 export const streamConversationChat = async (req, res) => {
   const userId = req.userId;
@@ -69,13 +73,19 @@ export const streamConversationChat = async (req, res) => {
     return res.status(401).json({ error: "Authentication required" });
   }
 
-  const { conversationId, prompt, imageUrl, model, systemInstruction } = req.body;
+  const { conversationId, prompt, imageUrl, model, systemInstruction, apiKey: bodyApiKey } = req.body;
+  const userApiKey = req.headers["x-goog-api-key"] || req.headers["x-api-key"] || bodyApiKey;
 
   if (!prompt && !imageUrl) {
     return res.status(400).json({ error: "A prompt or image is required" });
   }
 
-  const targetModel = model || "gemini-2.5-flash";
+  // Google deprecated gemini-2.5-flash for new users; default to gemini-3.8-flash
+  let targetModel = model || "gemini-3.8-flash";
+  if (targetModel === "gemini-2.5-flash") {
+    targetModel = "gemini-3.8-flash";
+  }
+
   let activeConversation = null;
   let isNewSession = false;
 
@@ -150,7 +160,7 @@ export const streamConversationChat = async (req, res) => {
       .lean();
 
     // Prepare contents for Gemini
-    const ai = getAIClient();
+    const ai = getAIClient(userApiKey);
     let contents;
 
     if (imageUrl && typeof imageUrl === "string" && imageUrl.startsWith("data:")) {
@@ -167,21 +177,32 @@ export const streamConversationChat = async (req, res) => {
       ];
     } else if (recentMessages.length > 1) {
       // Multi-turn context for Gemini
-      contents = recentMessages.map((m) => ({
-        role: m.role === "assistant" ? "model" : "user",
-        parts: [{ text: m.content || "" }],
-      }));
+      const validHistory = recentMessages
+        .map((m) => ({
+          role: m.role === "assistant" ? "model" : "user",
+          parts: [{ text: (m.content || "").trim() }],
+        }))
+        .filter((m) => m.parts[0].text.length > 0);
+
+      // Ensure the first message is from a 'user'
+      while (validHistory.length > 0 && validHistory[0].role !== "user") {
+        validHistory.shift();
+      }
+
+      contents = validHistory.length > 0 ? validHistory : (prompt || "Hello");
     } else {
       contents = prompt || "";
     }
 
-    // Model fallback chain: gemini-2.5-flash -> gemini-3.5-flash-lite -> gemini-flash-latest -> gemini-3.8-flash
-    const candidateModels = [
-      targetModel,
-      "gemini-3.5-flash-lite",
-      "gemini-flash-latest",
-      "gemini-3.8-flash",
-    ].filter(Boolean);
+    // Model fallback chain: targetModel -> gemini-3.8-flash -> gemini-3.5-flash -> gemini-flash-latest
+    const candidateModels = Array.from(
+      new Set([
+        targetModel,
+        "gemini-3.8-flash",
+        "gemini-3.5-flash",
+        "gemini-flash-latest",
+      ])
+    ).filter(Boolean);
 
     let stream = null;
     let selectedModel = candidateModels[0];
@@ -196,6 +217,7 @@ export const streamConversationChat = async (req, res) => {
         selectedModel = currentModel;
         break;
       } catch (modelErr) {
+        console.warn(`Model ${currentModel} failed, trying next candidate:`, modelErr?.message || modelErr);
         if (currentModel !== candidateModels[candidateModels.length - 1]) {
           continue;
         }
@@ -289,7 +311,7 @@ export const getConversationById = async (req, res) => {
       return res.status(401).json({ error: "Authentication required" });
     }
 
-    if (!mongoose.Types.ObjectId.isValid(id)) {
+    if (!id || !mongoose.Types.ObjectId.isValid(id)) {
       return res.status(404).json({ error: "Conversation not found" });
     }
 
@@ -325,19 +347,20 @@ export const deleteConversation = async (req, res) => {
       return res.status(401).json({ error: "Authentication required" });
     }
 
-    if (!mongoose.Types.ObjectId.isValid(id)) {
-      return res.status(404).json({ error: "Conversation not found" });
+    if (!id || !mongoose.Types.ObjectId.isValid(id)) {
+      return res.status(400).json({ error: "Invalid conversation ID format" });
     }
 
     const conversation = await Conversation.findOne({ _id: id, userId });
-    if (!conversation) {
-      return res.status(404).json({ error: "Conversation not found or unauthorized" });
-    }
 
     // Delete messages associated with this conversation
-    await Message.deleteMany({ conversationId: id });
-    await Conversation.deleteOne({ _id: id });
+    await Message.deleteMany({ conversationId: id, userId });
 
+    if (conversation) {
+      await Conversation.deleteOne({ _id: id });
+    }
+
+    // Return 200 idempotent success so client state synchronizes cleanly
     return res.status(200).json({
       success: true,
       message: "Conversation and messages deleted successfully",
@@ -365,7 +388,7 @@ export const createConversation = async (req, res) => {
     const conversation = await Conversation.create({
       userId,
       title: title?.trim() || "New Chat",
-      model: model || "gemini-2.5-flash",
+      model: model || "gemini-3.8-flash",
     });
 
     return res.status(201).json({ success: true, conversation });

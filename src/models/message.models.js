@@ -30,7 +30,7 @@ const messageSchema = new mongoose.Schema(
     },
     model: {
       type: String,
-      default: "gemini-2.5-flash",
+      default: "gemini-3.8-flash",
     },
   },
   {

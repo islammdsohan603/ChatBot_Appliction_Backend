@@ -2,12 +2,16 @@ import { GoogleGenAI } from "@google/genai";
 import AiChat from "../models/aiChat.models.js";
 
 /**
- * Initializes GoogleGenAI client using server environment variable
+ * Initializes GoogleGenAI client using server environment variable or user-provided key
  */
-const getAIClient = () => {
-  const apiKey = process.env.GOOGLE_API_KEY || process.env.GOOGEL_API_KEY;
+const getAIClient = (customKey) => {
+  const apiKey =
+    customKey ||
+    process.env.GOOGLE_API_KEY ||
+    process.env.GOOGEL_API_KEY ||
+    process.env.GEMINI_API_KEY;
   if (!apiKey) {
-    throw new Error("GOOGLE_API_KEY is not configured on the server");
+    throw new Error("GOOGLE_API_KEY is not configured on the server or provided in request");
   }
   return new GoogleGenAI({ apiKey });
 };
@@ -52,7 +56,7 @@ export const saveAiMessage = async (req, res) => {
       role,
       prompt: prompt || "",
       imageUrl: imageUrl || null,
-      model: model || "gemini-2.5-flash",
+      model: model || "gemini-3.8-flash",
     });
 
     return res.status(201).json({ success: true, message: saved });
@@ -102,19 +106,25 @@ export const clearAiHistory = async (req, res) => {
 /**
  * Stream AI Chat controller via Server-Sent Events (SSE) with database persistence
  * POST /api/ai/chat/stream
- * Body: { prompt?: string, imageUrl?: string, messages?: Array<{ role: string, content?: string, text?: string }>, model?: string, systemInstruction?: string }
+ * Body: { prompt?: string, imageUrl?: string, messages?: Array<{ role: string, content?: string, text?: string }>, model?: string, systemInstruction?: string, apiKey?: string }
  */
 export const streamAiChat = async (req, res) => {
   try {
-    const { prompt, imageUrl, messages, model, systemInstruction } = req.body;
+    const { prompt, imageUrl, messages, model, systemInstruction, apiKey: bodyApiKey } = req.body;
     const userId = req.userId || null;
+    const userApiKey = req.headers["x-goog-api-key"] || req.headers["x-api-key"] || bodyApiKey;
 
     if (!prompt && !imageUrl && (!Array.isArray(messages) || messages.length === 0)) {
       return res.status(400).json({ error: "A prompt, image, or messages array is required" });
     }
 
+    // Google deprecated gemini-2.5-flash for new users; default to gemini-3.8-flash
+    let targetModel = model || "gemini-3.8-flash";
+    if (targetModel === "gemini-2.5-flash") {
+      targetModel = "gemini-3.8-flash";
+    }
+
     // 1. Persist user input to database concurrently/before querying AI
-    const targetModel = model || "gemini-2.5-flash";
     let userSavePromise = Promise.resolve();
     if (prompt || imageUrl) {
       userSavePromise = AiChat.create({
@@ -128,7 +138,7 @@ export const streamAiChat = async (req, res) => {
       });
     }
 
-    const ai = getAIClient();
+    const ai = getAIClient(userApiKey);
 
     // 2. Prepare multimodal contents for Gemini
     let contents;
@@ -147,10 +157,18 @@ export const streamAiChat = async (req, res) => {
       ];
     } else if (Array.isArray(messages) && messages.length > 0) {
       // Multi-turn conversation history
-      contents = messages.map((m) => ({
-        role: m.role === "assistant" || m.role === "model" ? "model" : "user",
-        parts: [{ text: m.content || m.text || "" }],
-      }));
+      const validHistory = messages
+        .map((m) => ({
+          role: m.role === "assistant" || m.role === "model" ? "model" : "user",
+          parts: [{ text: (m.content || m.text || "").trim() }],
+        }))
+        .filter((m) => m.parts[0].text.length > 0);
+
+      while (validHistory.length > 0 && validHistory[0].role !== "user") {
+        validHistory.shift();
+      }
+
+      contents = validHistory.length > 0 ? validHistory : (prompt || "Hello");
     } else {
       contents = prompt || "";
     }
@@ -162,13 +180,15 @@ export const streamAiChat = async (req, res) => {
     res.setHeader("X-Accel-Buffering", "no");
     res.flushHeaders?.();
 
-    // Model fallback chain: user-requested / gemini-2.5-flash -> gemini-3.5-flash-lite -> gemini-flash-latest -> gemini-3.8-flash
-    const candidateModels = [
-      model || "gemini-2.5-flash",
-      "gemini-3.5-flash-lite",
-      "gemini-flash-latest",
-      "gemini-3.8-flash",
-    ].filter(Boolean);
+    // Model fallback chain: targetModel -> gemini-3.8-flash -> gemini-3.5-flash -> gemini-flash-latest
+    const candidateModels = Array.from(
+      new Set([
+        targetModel,
+        "gemini-3.8-flash",
+        "gemini-3.5-flash",
+        "gemini-flash-latest",
+      ])
+    ).filter(Boolean);
 
     let stream = null;
     let selectedModel = candidateModels[0];
@@ -183,6 +203,7 @@ export const streamAiChat = async (req, res) => {
         selectedModel = currentModel;
         break;
       } catch (modelErr) {
+        console.warn(`Model ${currentModel} failed, trying next candidate:`, modelErr?.message || modelErr);
         if (currentModel !== candidateModels[candidateModels.length - 1]) {
           continue;
         }
