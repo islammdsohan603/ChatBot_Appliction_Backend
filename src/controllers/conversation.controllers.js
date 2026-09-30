@@ -80,10 +80,10 @@ export const streamConversationChat = async (req, res) => {
     return res.status(400).json({ error: "A prompt or image is required" });
   }
 
-  // Google deprecated gemini-2.5-flash for new users; default to gemini-3.8-flash
-  let targetModel = model || "gemini-3.8-flash";
-  if (targetModel === "gemini-2.5-flash") {
-    targetModel = "gemini-3.8-flash";
+  // Default to gemini-2.0-flash
+  let targetModel = model || "gemini-2.0-flash";
+  if (targetModel === "gemini-2.5-flash" || targetModel === "gemini-3.8-flash") {
+    targetModel = "gemini-2.0-flash";
   }
 
   let activeConversation = null;
@@ -237,14 +237,13 @@ const buildAlternatingContents = (messages, currentPrompt, currentImageUrl) => {
     const ai = getAIClient(userApiKey);
     const contents = buildAlternatingContents(recentMessages, prompt, imageUrl);
 
-    // Model fallback chain: targetModel -> gemini-3.8-flash -> gemini-3.5-flash -> gemini-3.7-flash -> gemini-2.5-flash -> gemini-flash-latest
+    // Model fallback chain: targetModel -> gemini-2.0-flash -> gemini-1.5-flash -> gemini-1.5-pro -> gemini-flash-latest
     const candidateModels = Array.from(
       new Set([
         targetModel,
-        "gemini-3.8-flash",
-        "gemini-3.5-flash",
-        "gemini-3.7-flash",
-        "gemini-2.5-flash",
+        "gemini-2.0-flash",
+        "gemini-1.5-flash",
+        "gemini-1.5-pro",
         "gemini-flash-latest",
       ])
     ).filter(Boolean);
