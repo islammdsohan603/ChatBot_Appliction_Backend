@@ -9,6 +9,10 @@ import userRouter from "./routes/user.routes.js";
 import chatRouter from "./routes/chat.routes.js";
 import aiRouter from "./routes/ai.routes.js";
 import conversationRouter from "./routes/conversation.routes.js";
+import pricingRouter from "./routes/pricing.routes.js";
+import communityRouter from "./routes/community.routes.js";
+import dashboardRouter from "./routes/dashboard.routes.js";
+import docsRouter from "./routes/docs.routes.js";
 
 dotenv.config();
 
@@ -50,6 +54,10 @@ app.use("/api/user", userRouter);
 app.use("/api/chat", chatRouter);
 app.use("/api/ai", aiRouter);
 app.use("/api/conversations", conversationRouter);
+app.use("/api/pricing", pricingRouter);
+app.use("/api/community", communityRouter);
+app.use("/api/dashboard", dashboardRouter);
+app.use("/api/docs", docsRouter);
 
 app.get("/", (req, res) => {
   res.send("Chat Application Backend is Running");

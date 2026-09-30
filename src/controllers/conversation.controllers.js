@@ -151,7 +151,81 @@ export const streamConversationChat = async (req, res) => {
       );
     }
 
-    // 5. Retrieve sliding window of up to 20 historical messages for multi-turn context
+const buildAlternatingContents = (messages, currentPrompt, currentImageUrl) => {
+  const turns = [];
+
+  for (const m of messages) {
+    const role = m.role === "assistant" || m.role === "model" ? "model" : "user";
+    const text = (m.content || m.text || "").trim();
+    const parts = [];
+
+    if (m.imageUrl && typeof m.imageUrl === "string" && m.imageUrl.startsWith("data:")) {
+      const [metaPart, base64Part] = m.imageUrl.split(";base64,");
+      const mimeType = metaPart.replace("data:", "") || "image/jpeg";
+      parts.push({
+        inlineData: {
+          data: base64Part,
+          mimeType,
+        },
+      });
+    }
+
+    if (text) {
+      parts.push({ text });
+    }
+
+    if (parts.length > 0) {
+      turns.push({ role, parts });
+    }
+  }
+
+  // Ensure first turn is from 'user'
+  while (turns.length > 0 && turns[0].role !== "user") {
+    turns.shift();
+  }
+
+  // Merge consecutive same-role turns to strictly comply with Gemini API
+  const cleanTurns = [];
+  for (const turn of turns) {
+    if (cleanTurns.length > 0 && cleanTurns[cleanTurns.length - 1].role === turn.role) {
+      const prevTurn = cleanTurns[cleanTurns.length - 1];
+      const prevTextPart = prevTurn.parts.find((p) => typeof p.text === "string");
+      const newTextPart = turn.parts.find((p) => typeof p.text === "string");
+      if (prevTextPart && newTextPart) {
+        prevTextPart.text += "\n" + newTextPart.text;
+      } else if (newTextPart) {
+        prevTurn.parts.push(newTextPart);
+      }
+      const newImageParts = turn.parts.filter((p) => p.inlineData);
+      prevTurn.parts.push(...newImageParts);
+    } else {
+      cleanTurns.push(turn);
+    }
+  }
+
+  // Fallback if turns ended up empty
+  if (cleanTurns.length === 0) {
+    const parts = [];
+    if (currentImageUrl && typeof currentImageUrl === "string" && currentImageUrl.startsWith("data:")) {
+      const [metaPart, base64Part] = currentImageUrl.split(";base64,");
+      const mimeType = metaPart.replace("data:", "") || "image/jpeg";
+      parts.push({
+        inlineData: {
+          data: base64Part,
+          mimeType,
+        },
+      });
+    }
+    parts.push({ text: currentPrompt || "Hello" });
+    cleanTurns.push({ role: "user", parts });
+  } else if (cleanTurns[cleanTurns.length - 1].role !== "user") {
+    cleanTurns.push({ role: "user", parts: [{ text: currentPrompt || "Continue" }] });
+  }
+
+  return cleanTurns;
+};
+
+    // 5. Retrieve sliding window of historical messages for multi-turn context
     const recentMessages = await Message.find({
       conversationId: activeConversation._id,
     })
@@ -159,47 +233,18 @@ export const streamConversationChat = async (req, res) => {
       .limit(20)
       .lean();
 
-    // Prepare contents for Gemini
+    // Prepare contents for Gemini with strictly alternating turns
     const ai = getAIClient(userApiKey);
-    let contents;
+    const contents = buildAlternatingContents(recentMessages, prompt, imageUrl);
 
-    if (imageUrl && typeof imageUrl === "string" && imageUrl.startsWith("data:")) {
-      const [metaPart, base64Part] = imageUrl.split(";base64,");
-      const mimeType = metaPart.replace("data:", "") || "image/jpeg";
-      contents = [
-        {
-          inlineData: {
-            data: base64Part,
-            mimeType,
-          },
-        },
-        prompt || "Analyze this image",
-      ];
-    } else if (recentMessages.length > 1) {
-      // Multi-turn context for Gemini
-      const validHistory = recentMessages
-        .map((m) => ({
-          role: m.role === "assistant" ? "model" : "user",
-          parts: [{ text: (m.content || "").trim() }],
-        }))
-        .filter((m) => m.parts[0].text.length > 0);
-
-      // Ensure the first message is from a 'user'
-      while (validHistory.length > 0 && validHistory[0].role !== "user") {
-        validHistory.shift();
-      }
-
-      contents = validHistory.length > 0 ? validHistory : (prompt || "Hello");
-    } else {
-      contents = prompt || "";
-    }
-
-    // Model fallback chain: targetModel -> gemini-3.8-flash -> gemini-3.5-flash -> gemini-flash-latest
+    // Model fallback chain: targetModel -> gemini-3.8-flash -> gemini-3.5-flash -> gemini-3.7-flash -> gemini-2.5-flash -> gemini-flash-latest
     const candidateModels = Array.from(
       new Set([
         targetModel,
         "gemini-3.8-flash",
         "gemini-3.5-flash",
+        "gemini-3.7-flash",
+        "gemini-2.5-flash",
         "gemini-flash-latest",
       ])
     ).filter(Boolean);
@@ -219,6 +264,7 @@ export const streamConversationChat = async (req, res) => {
       } catch (modelErr) {
         console.warn(`Model ${currentModel} failed, trying next candidate:`, modelErr?.message || modelErr);
         if (currentModel !== candidateModels[candidateModels.length - 1]) {
+          await new Promise((r) => setTimeout(r, 600));
           continue;
         }
         throw modelErr;
@@ -232,13 +278,34 @@ export const streamConversationChat = async (req, res) => {
 
     let accumulatedText = "";
 
-    // 6. Stream tokens to client
-    for await (const chunk of stream) {
-      if (!isConnected) break;
-      const text = chunk.text;
-      if (text) {
-        accumulatedText += text;
-        res.write(`data: ${JSON.stringify({ text })}\n\n`);
+    // 6. Stream tokens to client with resilience against mid-stream JSON errors
+    try {
+      for await (const chunk of stream) {
+        if (!isConnected) break;
+        const text = chunk.text;
+        if (text) {
+          accumulatedText += text;
+          res.write(`data: ${JSON.stringify({ text })}\n\n`);
+        }
+      }
+    } catch (streamErr) {
+      console.warn("Stream interrupted:", streamErr?.message || streamErr);
+      if (!accumulatedText.trim() && isConnected) {
+        try {
+          const fallbackRes = await ai.models.generateContent({
+            model: selectedModel,
+            contents,
+            config: systemInstruction ? { systemInstruction } : undefined,
+          });
+          const fallbackText = fallbackRes.text || "";
+          if (fallbackText) {
+            accumulatedText = fallbackText;
+            res.write(`data: ${JSON.stringify({ text: fallbackText })}\n\n`);
+          }
+        } catch (fallbackErr) {
+          console.error("Non-streaming fallback failed:", fallbackErr?.message || fallbackErr);
+          throw streamErr;
+        }
       }
     }
 

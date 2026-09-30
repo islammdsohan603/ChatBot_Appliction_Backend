@@ -140,38 +140,91 @@ export const streamAiChat = async (req, res) => {
 
     const ai = getAIClient(userApiKey);
 
-    // 2. Prepare multimodal contents for Gemini
-    let contents;
-    if (imageUrl && typeof imageUrl === "string" && imageUrl.startsWith("data:")) {
-      // Multimodal: parse inline image data and pair with prompt
-      const [metaPart, base64Part] = imageUrl.split(";base64,");
-      const mimeType = metaPart.replace("data:", "") || "image/jpeg";
-      contents = [
-        {
+const buildAlternatingContents = (historyMessages, currentPrompt, currentImageUrl) => {
+  const turns = [];
+
+  if (Array.isArray(historyMessages)) {
+    for (const m of historyMessages) {
+      const role = m.role === "assistant" || m.role === "model" ? "model" : "user";
+      const text = (m.content || m.text || m.prompt || "").trim();
+      const parts = [];
+
+      if (m.imageUrl && typeof m.imageUrl === "string" && m.imageUrl.startsWith("data:")) {
+        const [metaPart, base64Part] = m.imageUrl.split(";base64,");
+        const mimeType = metaPart.replace("data:", "") || "image/jpeg";
+        parts.push({
           inlineData: {
             data: base64Part,
             mimeType,
           },
-        },
-        prompt || "Analyze this image",
-      ];
-    } else if (Array.isArray(messages) && messages.length > 0) {
-      // Multi-turn conversation history
-      const validHistory = messages
-        .map((m) => ({
-          role: m.role === "assistant" || m.role === "model" ? "model" : "user",
-          parts: [{ text: (m.content || m.text || "").trim() }],
-        }))
-        .filter((m) => m.parts[0].text.length > 0);
-
-      while (validHistory.length > 0 && validHistory[0].role !== "user") {
-        validHistory.shift();
+        });
       }
 
-      contents = validHistory.length > 0 ? validHistory : (prompt || "Hello");
-    } else {
-      contents = prompt || "";
+      if (text) {
+        parts.push({ text });
+      }
+
+      if (parts.length > 0) {
+        turns.push({ role, parts });
+      }
     }
+  }
+
+  // If prompt or image was passed directly and not in history, append it
+  if (currentPrompt || currentImageUrl) {
+    const parts = [];
+    if (currentImageUrl && typeof currentImageUrl === "string" && currentImageUrl.startsWith("data:")) {
+      const [metaPart, base64Part] = currentImageUrl.split(";base64,");
+      const mimeType = metaPart.replace("data:", "") || "image/jpeg";
+      parts.push({
+        inlineData: {
+          data: base64Part,
+          mimeType,
+        },
+      });
+    }
+    if (currentPrompt) {
+      parts.push({ text: currentPrompt.trim() });
+    }
+    if (parts.length > 0) {
+      turns.push({ role: "user", parts });
+    }
+  }
+
+  // Ensure first turn is 'user'
+  while (turns.length > 0 && turns[0].role !== "user") {
+    turns.shift();
+  }
+
+  // Merge consecutive same-role turns to strictly comply with Gemini API
+  const cleanTurns = [];
+  for (const turn of turns) {
+    if (cleanTurns.length > 0 && cleanTurns[cleanTurns.length - 1].role === turn.role) {
+      const prevTurn = cleanTurns[cleanTurns.length - 1];
+      const prevTextPart = prevTurn.parts.find((p) => typeof p.text === "string");
+      const newTextPart = turn.parts.find((p) => typeof p.text === "string");
+      if (prevTextPart && newTextPart) {
+        prevTextPart.text += "\n" + newTextPart.text;
+      } else if (newTextPart) {
+        prevTurn.parts.push(newTextPart);
+      }
+      const newImageParts = turn.parts.filter((p) => p.inlineData);
+      prevTurn.parts.push(...newImageParts);
+    } else {
+      cleanTurns.push(turn);
+    }
+  }
+
+  if (cleanTurns.length === 0) {
+    cleanTurns.push({ role: "user", parts: [{ text: currentPrompt || "Hello" }] });
+  } else if (cleanTurns[cleanTurns.length - 1].role !== "user") {
+    cleanTurns.push({ role: "user", parts: [{ text: currentPrompt || "Continue" }] });
+  }
+
+  return cleanTurns;
+};
+
+    const contents = buildAlternatingContents(messages, prompt, imageUrl);
 
     // Set Server-Sent Events (SSE) headers
     res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
@@ -180,12 +233,14 @@ export const streamAiChat = async (req, res) => {
     res.setHeader("X-Accel-Buffering", "no");
     res.flushHeaders?.();
 
-    // Model fallback chain: targetModel -> gemini-3.8-flash -> gemini-3.5-flash -> gemini-flash-latest
+    // Model fallback chain: targetModel -> gemini-3.8-flash -> gemini-3.5-flash -> gemini-3.7-flash -> gemini-2.5-flash -> gemini-flash-latest
     const candidateModels = Array.from(
       new Set([
         targetModel,
         "gemini-3.8-flash",
         "gemini-3.5-flash",
+        "gemini-3.7-flash",
+        "gemini-2.5-flash",
         "gemini-flash-latest",
       ])
     ).filter(Boolean);
@@ -205,6 +260,7 @@ export const streamAiChat = async (req, res) => {
       } catch (modelErr) {
         console.warn(`Model ${currentModel} failed, trying next candidate:`, modelErr?.message || modelErr);
         if (currentModel !== candidateModels[candidateModels.length - 1]) {
+          await new Promise((r) => setTimeout(r, 600));
           continue;
         }
         throw modelErr;
@@ -221,13 +277,34 @@ export const streamAiChat = async (req, res) => {
 
     let accumulatedText = "";
 
-    // Stream text chunks to client
-    for await (const chunk of stream) {
-      if (!isConnected) break;
-      const text = chunk.text;
-      if (text) {
-        accumulatedText += text;
-        res.write(`data: ${JSON.stringify({ text })}\n\n`);
+    // Stream text chunks to client with resilience
+    try {
+      for await (const chunk of stream) {
+        if (!isConnected) break;
+        const text = chunk.text;
+        if (text) {
+          accumulatedText += text;
+          res.write(`data: ${JSON.stringify({ text })}\n\n`);
+        }
+      }
+    } catch (streamErr) {
+      console.warn("AI Stream interrupted:", streamErr?.message || streamErr);
+      if (!accumulatedText.trim() && isConnected) {
+        try {
+          const fallbackRes = await ai.models.generateContent({
+            model: selectedModel,
+            contents,
+            config: systemInstruction ? { systemInstruction } : undefined,
+          });
+          const fallbackText = fallbackRes.text || "";
+          if (fallbackText) {
+            accumulatedText = fallbackText;
+            res.write(`data: ${JSON.stringify({ text: fallbackText })}\n\n`);
+          }
+        } catch (fallbackErr) {
+          console.error("Non-streaming fallback failed:", fallbackErr?.message || fallbackErr);
+          throw streamErr;
+        }
       }
     }
 

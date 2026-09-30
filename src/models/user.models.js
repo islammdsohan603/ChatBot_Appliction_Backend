@@ -30,6 +30,20 @@ const userSchema = new mongoose.Schema(
     bio: {
       type: String,
     },
+
+    subscriptionTier: {
+      type: String,
+      enum: ["free", "pro", "enterprise"],
+      default: "free",
+    },
+
+    profile: {
+      location: String,
+      website: String,
+      github: String,
+      twitter: String,
+      company: String,
+    },
   },
   {
     timestamps: true,
