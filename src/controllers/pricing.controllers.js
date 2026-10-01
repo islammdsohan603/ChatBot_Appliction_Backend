@@ -155,7 +155,6 @@ export const createCheckoutSession = async (req, res) => {
     const unitAmount = isYearly ? planData.priceYearly * 100 : planData.priceMonthly * 100; // Stripe uses cents
 
     const session = await getStripe().checkout.sessions.create({
-      payment_method_types: ["card"],
       mode: "payment",
       customer_email: user.email,
       metadata: {
