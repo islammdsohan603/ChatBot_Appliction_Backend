@@ -80,10 +80,16 @@ export const streamConversationChat = async (req, res) => {
     return res.status(400).json({ error: "A prompt or image is required" });
   }
 
-  // Default to gemini-2.0-flash
-  let targetModel = model || "gemini-2.0-flash";
-  if (targetModel === "gemini-2.5-flash" || targetModel === "gemini-3.8-flash") {
-    targetModel = "gemini-2.0-flash";
+  // Default to gemini-3.5-flash (fast, reliable, and active)
+  let targetModel = model || "gemini-3.5-flash";
+  if (
+    targetModel === "gemini-2.0-flash" ||
+    targetModel === "gemini-1.5-flash" ||
+    targetModel === "gemini-1.5-pro" ||
+    targetModel === "gemini-2.5-flash" ||
+    targetModel === "gemini-2.5-pro"
+  ) {
+    targetModel = "gemini-3.5-flash";
   }
 
   let activeConversation = null;
@@ -237,38 +243,16 @@ const buildAlternatingContents = (messages, currentPrompt, currentImageUrl) => {
     const ai = getAIClient(userApiKey);
     const contents = buildAlternatingContents(recentMessages, prompt, imageUrl);
 
-    // Model fallback chain: targetModel -> gemini-2.0-flash -> gemini-1.5-flash -> gemini-1.5-pro -> gemini-flash-latest
+    // Active Gemini model fallback chain (resilient against 503 high demand spikes)
     const candidateModels = Array.from(
       new Set([
         targetModel,
-        "gemini-2.0-flash",
-        "gemini-1.5-flash",
-        "gemini-1.5-pro",
+        "gemini-3.5-flash",
+        "gemini-3.5-flash-lite",
         "gemini-flash-latest",
+        "gemini-3.8-flash",
       ])
     ).filter(Boolean);
-
-    let stream = null;
-    let selectedModel = candidateModels[0];
-
-    for (const currentModel of candidateModels) {
-      try {
-        stream = await ai.models.generateContentStream({
-          model: currentModel,
-          contents,
-          config: systemInstruction ? { systemInstruction } : undefined,
-        });
-        selectedModel = currentModel;
-        break;
-      } catch (modelErr) {
-        console.warn(`Model ${currentModel} failed, trying next candidate:`, modelErr?.message || modelErr);
-        if (currentModel !== candidateModels[candidateModels.length - 1]) {
-          await new Promise((r) => setTimeout(r, 600));
-          continue;
-        }
-        throw modelErr;
-      }
-    }
 
     let isConnected = true;
     req.on("close", () => {
@@ -276,35 +260,72 @@ const buildAlternatingContents = (messages, currentPrompt, currentImageUrl) => {
     });
 
     let accumulatedText = "";
+    let selectedModel = candidateModels[0];
+    let streamSuccess = false;
+    let lastError = null;
 
-    // 6. Stream tokens to client with resilience against mid-stream JSON errors
-    try {
-      for await (const chunk of stream) {
-        if (!isConnected) break;
-        const text = chunk.text;
-        if (text) {
-          accumulatedText += text;
-          res.write(`data: ${JSON.stringify({ text })}\n\n`);
+    // 6. Stream tokens to client with automatic model fallback if experiencing high demand
+    for (const currentModel of candidateModels) {
+      if (!isConnected) break;
+      try {
+        const stream = await ai.models.generateContentStream({
+          model: currentModel,
+          contents,
+          config: systemInstruction ? { systemInstruction } : undefined,
+        });
+
+        for await (const chunk of stream) {
+          if (!isConnected) break;
+          const text = chunk.text;
+          if (text) {
+            accumulatedText += text;
+            res.write(`data: ${JSON.stringify({ text })}\n\n`);
+          }
+        }
+
+        selectedModel = currentModel;
+        streamSuccess = true;
+        break;
+      } catch (streamErr) {
+        lastError = streamErr;
+        console.warn(`Model ${currentModel} stream failed:`, streamErr?.message || streamErr);
+
+        // If we already sent tokens to client, stop rather than mixing model streams
+        if (accumulatedText.trim().length > 0) {
+          break;
+        }
+
+        // Delay briefly before trying next candidate
+        if (currentModel !== candidateModels[candidateModels.length - 1]) {
+          await new Promise((r) => setTimeout(r, 300));
         }
       }
-    } catch (streamErr) {
-      console.warn("Stream interrupted:", streamErr?.message || streamErr);
-      if (!accumulatedText.trim() && isConnected) {
+    }
+
+    // Non-streaming fallback if streaming didn't produce tokens
+    if (!streamSuccess && !accumulatedText.trim() && isConnected) {
+      for (const currentModel of candidateModels) {
         try {
           const fallbackRes = await ai.models.generateContent({
-            model: selectedModel,
+            model: currentModel,
             contents,
             config: systemInstruction ? { systemInstruction } : undefined,
           });
           const fallbackText = fallbackRes.text || "";
           if (fallbackText) {
             accumulatedText = fallbackText;
+            selectedModel = currentModel;
             res.write(`data: ${JSON.stringify({ text: fallbackText })}\n\n`);
+            streamSuccess = true;
+            break;
           }
         } catch (fallbackErr) {
-          console.error("Non-streaming fallback failed:", fallbackErr?.message || fallbackErr);
-          throw streamErr;
+          console.warn(`Non-streaming fallback model ${currentModel} failed:`, fallbackErr?.message || fallbackErr);
         }
+      }
+
+      if (!streamSuccess && lastError) {
+        throw lastError;
       }
     }
 
