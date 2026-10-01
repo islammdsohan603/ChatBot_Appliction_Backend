@@ -45,7 +45,14 @@ app.use(
     allowedHeaders: ["Content-Type", "Authorization", "Cookie"],
   })
 );
-app.use(express.json());
+app.use((req, res, next) => {
+  // Skip JSON body parsing for Stripe webhook route — it needs the raw body
+  if (req.originalUrl === "/api/pricing/webhook") {
+    next();
+  } else {
+    express.json()(req, res, next);
+  }
+});
 app.use(cookieParser());
 
 // Routes
