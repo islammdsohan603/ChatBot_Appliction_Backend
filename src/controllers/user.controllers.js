@@ -6,8 +6,9 @@ export const getCurrentUser = async (req, res) => {
     let userId = req.userId;
     let user = await User.findById(userId).select("-password");
     if (!user) {
-      return res.status(400).json({
-        message: "user not found",
+      return res.status(404).json({
+        success: false,
+        message: "User not found",
       });
     }
 

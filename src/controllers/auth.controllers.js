@@ -1,43 +1,61 @@
-import express from "express";
-import mongoose from "mongoose";
 import bcrypt from "bcryptjs";
-
 import User from "../models/user.models.js";
 import genToken from "../config/token.js";
 
-// user SignUp
-
+// ── User Sign Up ──
 export const signUp = async (req, res) => {
   try {
     const { userName, email, password } = req.body;
-    const checkUserByUserName = await User.findOne({ userName });
 
-    if (checkUserByUserName) {
+    if (!userName || !userName.trim()) {
       return res.status(400).json({
-        message: "user Name already exist!",
+        success: false,
+        message: "Username is required.",
       });
     }
 
-    const checkUserbyEmail = await User.findOne({ email });
-
-    if (checkUserbyEmail) {
+    if (!email || !email.trim() || !/\S+@\S+\.\S+/.test(email.trim())) {
       return res.status(400).json({
-        message: "user Email already exist!",
+        success: false,
+        message: "A valid email address is required.",
       });
     }
 
-    if (password.length < 6) {
+    if (!password || password.length < 6) {
       return res.status(400).json({
-        message: "password must be at least 6 characters!",
+        success: false,
+        message: "Password must be at least 6 characters.",
       });
     }
 
-    const hassPassword = await bcrypt.hash(password, 10);
+    const normalizedEmail = email.toLowerCase().trim();
+    const normalizedUserName = userName.trim();
+
+    // Check duplicate email (status 409)
+    const existingEmail = await User.findOne({ email: normalizedEmail });
+    if (existingEmail) {
+      return res.status(409).json({
+        success: false,
+        message: "Email already registered",
+      });
+    }
+
+    // Check duplicate username (status 409)
+    const existingUsername = await User.findOne({ userName: normalizedUserName });
+    if (existingUsername) {
+      return res.status(409).json({
+        success: false,
+        message: "Username already taken! Please choose another.",
+      });
+    }
+
+    const hashedPassword = await bcrypt.hash(password, 10);
 
     const user = await User.create({
-      userName,
-      email,
-      password: hassPassword,
+      userName: normalizedUserName,
+      email: normalizedEmail,
+      password: hashedPassword,
+      subscriptionTier: "free",
     });
 
     const token = await genToken(user._id);
@@ -51,40 +69,63 @@ export const signUp = async (req, res) => {
     });
 
     return res.status(201).json({
+      success: true,
       message: "User registered successfully",
+      token,
       user: {
         id: user._id,
+        _id: user._id,
         userName: user.userName,
         email: user.email,
+        subscriptionTier: user.subscriptionTier || "free",
       },
     });
   } catch (error) {
-    console.error(error);
+    console.error("signUp error:", error);
+
+    // Handle Mongo duplicate key index error (code 11000)
+    if (error.code === 11000) {
+      const field = Object.keys(error.keyPattern || {})[0] || "email";
+      return res.status(409).json({
+        success: false,
+        message: field === "userName" ? "Username already taken!" : "Email already registered",
+      });
+    }
 
     return res.status(500).json({
-      message: "signUp error",
+      success: false,
+      message: error.message || "Server error occurred during signup",
     });
   }
 };
 
-// user  lgoIn
-
+// ── User Log In ──
 export const logIn = async (req, res) => {
   try {
     const { email, password } = req.body;
-    const user = await User.findOne({ email });
+
+    if (!email || !email.trim() || !password) {
+      return res.status(400).json({
+        success: false,
+        message: "Email and password are required.",
+      });
+    }
+
+    const normalizedEmail = email.toLowerCase().trim();
+    const user = await User.findOne({ email: normalizedEmail });
 
     if (!user) {
       return res.status(400).json({
-        message: "user does not exist!",
+        success: false,
+        message: "User does not exist!",
       });
     }
 
     const isMatch = await bcrypt.compare(password, user.password);
-
     if (!isMatch) {
       return res.status(400).json({
-        message: "incorrect password",
+        success: false,
+        message: "Incorrect password.",
       });
     }
 
@@ -99,24 +140,28 @@ export const logIn = async (req, res) => {
     });
 
     return res.status(200).json({
+      success: true,
       message: "Login successful",
+      token,
       user: {
         id: user._id,
+        _id: user._id,
         userName: user.userName,
         email: user.email,
+        subscriptionTier: user.subscriptionTier || "free",
       },
     });
   } catch (error) {
-    console.error(error);
+    console.error("logIn error:", error);
 
     return res.status(500).json({
-      message: "login error",
+      success: false,
+      message: error.message || "Server error occurred during login",
     });
   }
 };
 
-// user logOut
-
+// ── User Log Out ──
 export const logOut = async (req, res) => {
   try {
     const isProduction = process.env.NODE_ENV === "production";
@@ -125,14 +170,17 @@ export const logOut = async (req, res) => {
       secure: isProduction,
       sameSite: isProduction ? "none" : "lax",
     });
+
     return res.status(200).json({
-      message: "log out successfully",
+      success: true,
+      message: "Logged out successfully",
     });
   } catch (error) {
-    console.error(error);
+    console.error("logOut error:", error);
 
     return res.status(500).json({
-      message: "LogOut error",
+      success: false,
+      message: error.message || "Server error during logout",
     });
   }
 };

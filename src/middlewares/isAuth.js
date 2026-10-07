@@ -2,19 +2,28 @@ import jwt from "jsonwebtoken";
 
 export const isAuth = async (req, res, next) => {
   try {
-    const token = req.cookies.token;
+    const authHeader = req.headers.authorization;
+    const bearerToken =
+      authHeader && authHeader.startsWith("Bearer ")
+        ? authHeader.slice(7).trim()
+        : null;
+
+    const token = req.cookies?.token || bearerToken || req.headers.token;
+
     if (!token) {
       return res.status(401).json({
-        message: "token is not found",
+        success: false,
+        message: "Authentication token is missing",
       });
     }
 
-    const verifyToken = await jwt.verify(token, process.env.JWT_SECRET);
+    const verifyToken = jwt.verify(token, process.env.JWT_SECRET);
     req.userId = verifyToken.userId;
     next();
   } catch (error) {
-    console.log("Middleware Error:", error.message || error);
+    console.warn("Auth Middleware Error:", error.message || error);
     return res.status(401).json({
+      success: false,
       message: "Invalid or expired token",
     });
   }
@@ -22,7 +31,14 @@ export const isAuth = async (req, res, next) => {
 
 export const optionalAuth = async (req, res, next) => {
   try {
-    const token = req.cookies?.token;
+    const authHeader = req.headers.authorization;
+    const bearerToken =
+      authHeader && authHeader.startsWith("Bearer ")
+        ? authHeader.slice(7).trim()
+        : null;
+
+    const token = req.cookies?.token || bearerToken || req.headers.token;
+
     if (token) {
       const verifyToken = jwt.verify(token, process.env.JWT_SECRET);
       req.userId = verifyToken.userId;
@@ -32,3 +48,5 @@ export const optionalAuth = async (req, res, next) => {
   }
   next();
 };
+
+export default isAuth;
