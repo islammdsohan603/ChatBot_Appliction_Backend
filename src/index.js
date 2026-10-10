@@ -19,10 +19,9 @@ dotenv.config();
 const app = express();
 const port = process.env.PORT || 8000;
 
-// Allowed origins for CORS
 const clientUrls = (process.env.CLIENT_URL || "")
   .split(",")
-  .map((u) => u.trim().replace(/\/+$/, ""))
+  .map((url) => url.trim().replace(/\/+$/, ""))
   .filter(Boolean);
 
 const allowedOrigins = [
@@ -34,7 +33,7 @@ const allowedOrigins = [
   ...clientUrls,
 ];
 
-// 1. Normalize double-slashes in incoming URLs (defense-in-depth against client trailing-slash errors)
+// Normalize repeated slashes in the request path.
 app.use((req, res, next) => {
   if (req.url && req.url.includes("//")) {
     req.url = req.url.replace(/\/{2,}/g, "/");
@@ -42,42 +41,89 @@ app.use((req, res, next) => {
   next();
 });
 
-// 2. CORS Middleware
+// CORS
 app.use(
   cors({
     origin: (origin, callback) => {
-      // Allow requests with no origin (curl, mobile apps, Postman)
       if (!origin) return callback(null, true);
+
+      let hostname;
+
+      try {
+        hostname = new URL(origin).hostname;
+      } catch {
+        return callback(new Error("Invalid request origin"));
+      }
+
       const normalizedOrigin = origin.replace(/\/+$/, "");
+
       if (
         process.env.NODE_ENV !== "production" ||
         allowedOrigins.includes(normalizedOrigin) ||
-        /\.vercel\.app$/.test(new URL(origin).hostname) ||
-        /\.onrender\.com$/.test(new URL(origin).hostname)
+        hostname.endsWith(".vercel.app") ||
+        hostname.endsWith(".onrender.com")
       ) {
-        callback(null, true);
-      } else {
-        callback(new Error(`CORS blocked for origin: ${origin}`));
+        return callback(null, true);
       }
+
+      return callback(new Error(`CORS blocked for origin: ${origin}`));
     },
     credentials: true,
     methods: ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization", "Cookie", "X-Requested-With"],
+    allowedHeaders: [
+      "Content-Type",
+      "Authorization",
+      "Cookie",
+      "X-Requested-With",
+    ],
     exposedHeaders: ["Set-Cookie"],
-  })
+  }),
 );
 
+// Preserve the raw body for Stripe webhook verification.
 app.use((req, res, next) => {
-  // Skip JSON body parsing for Stripe webhook route — it needs the raw body
-  if (req.originalUrl === "/api/pricing/webhook") {
-    next();
-  } else {
-    express.json()(req, res, next);
+  if (req.originalUrl.split("?")[0] === "/api/pricing/webhook") {
+    return next();
   }
+
+  return express.json()(req, res, next);
 });
+
 app.use(cookieParser());
 
-// Routes
+// Cache the connection promise for this serverless instance.
+let dbPromise;
+
+const ensureDB = async (req, res, next) => {
+  try {
+    if (!dbPromise) {
+      dbPromise = connectDB().catch((error) => {
+        dbPromise = null;
+        throw error;
+      });
+    }
+
+    await dbPromise;
+    next();
+  } catch (error) {
+    console.error("Database connection error:", error);
+
+    res.status(503).json({
+      success: false,
+      message: "Database connection unavailable",
+    });
+  }
+};
+
+// Health check does not require a database connection.
+app.get("/", (req, res) => {
+  res.status(200).send("Chat Application Backend is Running");
+});
+
+// Connect to MongoDB before accessing API routes.
+app.use("/api", ensureDB);
+
+// API routes
 app.use("/api/auth", authRouter);
 app.use("/api/user", userRouter);
 app.use("/api/chat", chatRouter);
@@ -88,27 +134,18 @@ app.use("/api/community", communityRouter);
 app.use("/api/dashboard", dashboardRouter);
 app.use("/api/docs", docsRouter);
 
-app.get("/", (req, res) => {
-  res.send("Chat Application Backend is Running");
-});
-
-// Start Server
-const startServer = async () => {
-  try {
-    if (!process.env.MONGO_DB_URL) {
-      console.warn("⚠️ Warning: MONGO_DB_URL environment variable is not defined!");
-    }
-    if (!process.env.JWT_SECRET) {
-      console.warn("⚠️ Warning: JWT_SECRET environment variable is not defined!");
-    }
-    await connectDB();
-
-    app.listen(port, () => {
-      console.log(`Server started on port ${port}`);
+// Start a persistent server only for local development.
+if (!process.env.VERCEL) {
+  connectDB()
+    .then(() => {
+      app.listen(port, () => {
+        console.log(`Server started on port ${port}`);
+      });
+    })
+    .catch((error) => {
+      console.error("Server startup error:", error);
+      process.exit(1);
     });
-  } catch (error) {
-    console.error("Server startup error:", error);
-  }
-};
+}
 
-startServer();
+export default app;
