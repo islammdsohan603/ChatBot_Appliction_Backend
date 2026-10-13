@@ -1,6 +1,7 @@
 import Conversation from "../models/conversation.models.js";
 import Message from "../models/message.models.js";
 import User from "../models/user.models.js";
+import { getUserUsageAndLimits } from "../utils/usageLimits.js";
 
 /**
  * Get aggregated dashboard metrics & stats for current user
@@ -14,6 +15,8 @@ export const getDashboardStats = async (req, res) => {
     }
 
     const user = await User.findById(userId).select("-password").lean();
+    const userTier = user?.subscriptionTier || "free";
+    const todayUsage = await getUserUsageAndLimits(userId, userTier);
 
     // 1. Fetch conversations count & recent sessions
     const totalConversations = await Conversation.countDocuments({ userId });
@@ -57,7 +60,8 @@ export const getDashboardStats = async (req, res) => {
         totalMessages,
         estimatedTokens,
         estimatedStorageMb: `${estimatedStorageMb} MB`,
-        subscriptionTier: user?.subscriptionTier || "free",
+        subscriptionTier: userTier,
+        todayUsage,
         streakDays: Math.min(Math.max(totalConversations, 1), 14),
         recentConversations,
         user: {

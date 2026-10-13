@@ -1,5 +1,7 @@
 import { GoogleGenAI } from "@google/genai";
 import AiChat from "../models/aiChat.models.js";
+import User from "../models/user.models.js";
+import { verifyUsageAccess, incrementUsage } from "../utils/usageLimits.js";
 
 /**
  * Initializes GoogleGenAI client using server environment variable or user-provided key
@@ -122,6 +124,34 @@ export const streamAiChat = async (req, res) => {
     let targetModel = model || "gemini-3.8-flash";
     if (targetModel === "gemini-2.5-flash") {
       targetModel = "gemini-3.8-flash";
+    }
+
+    // Check usage limits if authenticated user
+    if (userId) {
+      const user = await User.findById(userId).select("subscriptionTier").lean();
+      const userTier = user?.subscriptionTier || "free";
+
+      const access = await verifyUsageAccess({
+        userId,
+        userTier,
+        model: targetModel,
+        hasImage: Boolean(imageUrl),
+        promptLength: (prompt || "").length,
+      });
+
+      if (!access.allowed) {
+        return res.status(403).json({
+          success: false,
+          error: access.error,
+          reason: access.reason,
+          tier: access.tier,
+          limit: access.limit,
+          used: access.used,
+          remaining: access.remaining,
+          resetsAt: access.resetsAt,
+          upgradeUrl: access.upgradeUrl || "/pricing",
+        });
+      }
     }
 
     // 1. Persist user input to database concurrently/before querying AI
@@ -323,6 +353,15 @@ const buildAlternatingContents = (historyMessages, currentPrompt, currentImageUr
         }).catch((dbErr) => {
           console.error("Failed to persist assistant response:", dbErr);
         });
+
+        // Record daily usage consumption
+        if (userId) {
+          incrementUsage(userId, {
+            messages: 1,
+            images: imageUrl ? 1 : 0,
+            tokens: Math.round(((prompt?.length || 0) + accumulatedText.length) / 3.8),
+          }).catch((err) => console.error("Failed to increment usage in ai chat:", err));
+        }
       }
     }
   } catch (error) {

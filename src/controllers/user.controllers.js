@@ -1,5 +1,6 @@
 import uploadOnCloudinary from "../config/cloudinary.js";
 import User from "../models/user.models.js";
+import { getUserUsageAndLimits } from "../utils/usageLimits.js";
 
 export const getCurrentUser = async (req, res) => {
   try {
@@ -69,3 +70,26 @@ export const editProfile = async (req, res) => {
     });
   }
 };
+
+export const getUserUsage = async (req, res) => {
+  try {
+    const userId = req.userId;
+    if (!userId) {
+      return res.status(401).json({ error: "Authentication required" });
+    }
+
+    const user = await User.findById(userId).select("subscriptionTier email userName");
+    const tier = user?.subscriptionTier || "free";
+
+    const usageInfo = await getUserUsageAndLimits(userId, tier);
+
+    return res.status(200).json({
+      success: true,
+      ...usageInfo,
+    });
+  } catch (error) {
+    console.error("Get User Usage Error:", error);
+    return res.status(500).json({ error: "Failed to retrieve usage stats" });
+  }
+};
+

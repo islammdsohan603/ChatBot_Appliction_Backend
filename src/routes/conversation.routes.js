@@ -5,6 +5,7 @@ import {
   getConversationById,
   deleteConversation,
   createConversation,
+  exportConversation,
 } from "../controllers/conversation.controllers.js";
 import { isAuth } from "../middlewares/isAuth.js";
 
@@ -19,6 +20,9 @@ conversationRouter.get("/", isAuth, getUserConversations);
 // Create new conversation explicitly (REST fallback)
 conversationRouter.post("/", isAuth, createConversation);
 
+// Export conversation transcript (Pro Privilege)
+conversationRouter.get("/:id/export", isAuth, exportConversation);
+
 // Retrieve single conversation with all messages
 conversationRouter.get("/:id", isAuth, getConversationById);
 
@@ -26,3 +30,4 @@ conversationRouter.get("/:id", isAuth, getConversationById);
 conversationRouter.delete("/:id", isAuth, deleteConversation);
 
 export default conversationRouter;
+

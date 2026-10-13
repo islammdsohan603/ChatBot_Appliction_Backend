@@ -2,6 +2,8 @@ import mongoose from "mongoose";
 import { GoogleGenAI } from "@google/genai";
 import Conversation from "../models/conversation.models.js";
 import Message from "../models/message.models.js";
+import User from "../models/user.models.js";
+import { verifyUsageAccess, incrementUsage } from "../utils/usageLimits.js";
 
 /**
  * Initializes GoogleGenAI client using server environment variable or user-provided key
@@ -96,6 +98,32 @@ export const streamConversationChat = async (req, res) => {
   let isNewSession = false;
 
   try {
+    // 0. Verify subscription tier permissions and usage quotas
+    const user = await User.findById(userId).select("subscriptionTier").lean();
+    const userTier = user?.subscriptionTier || "free";
+
+    const access = await verifyUsageAccess({
+      userId,
+      userTier,
+      model: targetModel,
+      hasImage: Boolean(imageUrl),
+      promptLength: (prompt || "").length,
+    });
+
+    if (!access.allowed) {
+      return res.status(403).json({
+        success: false,
+        error: access.error,
+        reason: access.reason,
+        tier: access.tier,
+        limit: access.limit,
+        used: access.used,
+        remaining: access.remaining,
+        resetsAt: access.resetsAt,
+        upgradeUrl: access.upgradeUrl || "/pricing",
+      });
+    }
+
     // 1. Resolve or create Conversation
     if (conversationId && conversationId !== "new") {
       if (!mongoose.Types.ObjectId.isValid(conversationId)) {
@@ -348,6 +376,13 @@ const buildAlternatingContents = (messages, currentPrompt, currentImageUrl) => {
           lastMessage: accumulatedText.trim().slice(0, 100),
           updatedAt: new Date(),
         });
+
+        // Record usage consumption for user's daily quota
+        await incrementUsage(userId, {
+          messages: 1,
+          images: imageUrl ? 1 : 0,
+          tokens: Math.round(((prompt?.length || 0) + accumulatedText.length) / 3.8),
+        });
       }
     }
   } catch (error) {
@@ -484,3 +519,97 @@ export const createConversation = async (req, res) => {
     return res.status(500).json({ error: "Failed to create conversation" });
   }
 };
+
+/**
+ * Export conversation transcript in JSON or Markdown (Pro Privilege)
+ * GET /api/conversations/:id/export?format=markdown|json
+ */
+export const exportConversation = async (req, res) => {
+  try {
+    const userId = req.userId;
+    const { id } = req.params;
+    const format = (req.query.format || "markdown").toLowerCase();
+
+    if (!userId) {
+      return res.status(401).json({ error: "Authentication required" });
+    }
+
+    if (!id || !mongoose.Types.ObjectId.isValid(id)) {
+      return res.status(400).json({ error: "Invalid conversation ID format" });
+    }
+
+    const user = await User.findById(userId).select("subscriptionTier").lean();
+    const userTier = user?.subscriptionTier || "free";
+
+    // Pro privilege check: free users cannot export conversation transcripts
+    if (userTier === "free") {
+      return res.status(403).json({
+        success: false,
+        requiresUpgrade: true,
+        error: "Conversation history export is a Pro privilege. Upgrade to Pro to download your full chat transcripts in Markdown and JSON formats.",
+        upgradeUrl: "/pricing",
+      });
+    }
+
+    const conversation = await Conversation.findOne({ _id: id, userId }).lean();
+    if (!conversation) {
+      return res.status(404).json({ error: "Conversation not found" });
+    }
+
+    const messages = await Message.find({ conversationId: id, userId })
+      .sort({ createdAt: 1 })
+      .lean();
+
+    const sanitizedTitle = (conversation.title || "conversation")
+      .replace(/[^a-zA-Z0-9_-]/g, "_")
+      .slice(0, 40);
+
+    if (format === "json") {
+      res.setHeader(
+        "Content-Disposition",
+        `attachment; filename="${sanitizedTitle}-${id}.json"`
+      );
+      res.setHeader("Content-Type", "application/json");
+      return res.status(200).json({
+        title: conversation.title,
+        model: conversation.model,
+        exportedAt: new Date().toISOString(),
+        totalMessages: messages.length,
+        messages: messages.map((m) => ({
+          role: m.role,
+          content: m.content,
+          imageUrl: m.imageUrl,
+          timestamp: m.createdAt,
+        })),
+      });
+    }
+
+    // Default: Markdown formatted transcript
+    let md = `# ${conversation.title || "Nexora AI Conversation"}\n\n`;
+    md += `> **Model:** ${conversation.model || "Gemini"}  \n`;
+    md += `> **Date:** ${new Date(conversation.createdAt || Date.now()).toLocaleString()}  \n`;
+    md += `> **Total Messages:** ${messages.length}  \n\n`;
+    md += `---\n\n`;
+
+    messages.forEach((m) => {
+      const isUser = m.role === "user";
+      const timestamp = new Date(m.createdAt).toLocaleTimeString();
+      md += `### ${isUser ? "👤 You" : "🤖 Nexora AI"} *(${timestamp})*\n\n`;
+      if (m.imageUrl) {
+        md += `![Attachment](${m.imageUrl})\n\n`;
+      }
+      md += `${m.content || ""}\n\n---\n\n`;
+    });
+
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename="${sanitizedTitle}-${id}.md"`
+    );
+    res.setHeader("Content-Type", "text/markdown; charset=utf-8");
+    return res.status(200).send(md);
+  } catch (error) {
+    console.error("Export Conversation Error:", error);
+    return res.status(500).json({ error: "Failed to export conversation" });
+  }
+};
+

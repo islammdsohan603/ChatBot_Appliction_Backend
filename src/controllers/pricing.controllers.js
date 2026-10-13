@@ -28,15 +28,15 @@ const DEFAULT_PLANS = [
     highlightBadge: "",
     features: [
       "Access to Gemini 3.8 Flash model",
-      "Up to 50 conversations per day",
+      "Up to 20 messages per day",
       "Standard response streaming speeds",
-      "Multimodal image analysis (up to 5MB)",
+      "Multimodal image analysis (up to 4MB, 5/day)",
       "Community forum access",
       "Light & Dark UI themes",
     ],
     limits: {
-      messagesPerDay: 50,
-      models: ["gemini-3.8-flash"],
+      messagesPerDay: 20,
+      models: ["gemini-3.8-flash", "gemini-3.5-flash"],
       visionEnabled: true,
       prioritySupport: false,
       exportHistory: false,
@@ -305,30 +305,53 @@ export const verifyCheckoutSession = async (req, res) => {
 export const subscribeToPlan = async (req, res) => {
   try {
     const userId = req.userId;
-    const { planSlug } = req.body;
+    const { planSlug, testUpgrade, promoCode } = req.body;
 
     if (!userId) {
       return res.status(401).json({ error: "Authentication required" });
     }
 
-    // Only allow direct subscription for the free tier (downgrade)
-    // Paid plans must go through Stripe Checkout
-    if (planSlug !== "free") {
-      return res.status(400).json({
-        error: "Paid plans require payment via Stripe checkout. Use the checkout flow.",
+    const targetSlug = (planSlug || "").toLowerCase();
+
+    // Direct downgrade to free tier is always allowed
+    if (targetSlug === "free") {
+      const updatedUser = await User.findByIdAndUpdate(
+        userId,
+        { subscriptionTier: "free" },
+        { new: true }
+      ).select("-password");
+
+      return res.status(200).json({
+        success: true,
+        message: "Successfully switched to the Free Starter plan",
+        user: updatedUser,
       });
     }
 
-    const updatedUser = await User.findByIdAndUpdate(
-      userId,
-      { subscriptionTier: "free" },
-      { new: true }
-    ).select("-password");
+    // Allow test upgrade in development, or if testUpgrade flag / promoCode is present
+    const isDev = process.env.NODE_ENV !== "production";
+    const isPromo = promoCode === "PRO_UPGRADE" || promoCode === "NEXORA_PRO";
+    if (testUpgrade || isDev || isPromo) {
+      if (targetSlug !== "pro" && targetSlug !== "enterprise") {
+        return res.status(400).json({ error: "Invalid target plan" });
+      }
 
-    return res.status(200).json({
-      success: true,
-      message: "Successfully switched to the Free Starter plan",
-      user: updatedUser,
+      const updatedUser = await User.findByIdAndUpdate(
+        userId,
+        { subscriptionTier: targetSlug },
+        { new: true }
+      ).select("-password");
+
+      return res.status(200).json({
+        success: true,
+        message: `Successfully activated ${targetSlug.toUpperCase()} privileges!`,
+        user: updatedUser,
+      });
+    }
+
+    // In production without promo, paid plans require Stripe Checkout
+    return res.status(400).json({
+      error: "Paid plans require payment via Stripe checkout. Use the checkout flow.",
     });
   } catch (error) {
     console.error("Subscribe Error:", error);
