@@ -2,6 +2,11 @@ import { GoogleGenAI } from "@google/genai";
 import AiChat from "../models/aiChat.models.js";
 import User from "../models/user.models.js";
 import { verifyUsageAccess, incrementUsage } from "../utils/usageLimits.js";
+import {
+  isOpenAIConfigured,
+  streamOpenAIResponse,
+  generateOpenAIResponse,
+} from "../utils/openaiBackup.js";
 
 /**
  * Initializes GoogleGenAI client using server environment variable or user-provided key
@@ -168,7 +173,21 @@ export const streamAiChat = async (req, res) => {
       });
     }
 
-    const ai = getAIClient(userApiKey);
+    // Resolve optional custom OpenAI backup API key from request headers or body
+    const userOpenAiKey =
+      req.headers["x-openai-api-key"] ||
+      req.headers["x-open-api-key"] ||
+      req.body.openAiApiKey ||
+      req.body.openApiKey;
+
+    let ai = null;
+    let lastError = null;
+    try {
+      ai = getAIClient(userApiKey);
+    } catch (clientErr) {
+      lastError = clientErr;
+      console.warn("[Google AI] Client initialization skipped:", clientErr.message);
+    }
 
 const buildAlternatingContents = (historyMessages, currentPrompt, currentImageUrl) => {
   const turns = [];
@@ -263,79 +282,139 @@ const buildAlternatingContents = (historyMessages, currentPrompt, currentImageUr
     res.setHeader("X-Accel-Buffering", "no");
     res.flushHeaders?.();
 
-    // Model fallback chain: targetModel -> gemini-3.8-flash -> gemini-3.5-flash -> gemini-3.7-flash -> gemini-2.5-flash -> gemini-flash-latest
-    const candidateModels = Array.from(
-      new Set([
-        targetModel,
-        "gemini-3.8-flash",
-        "gemini-3.5-flash",
-        "gemini-3.7-flash",
-        "gemini-2.5-flash",
-        "gemini-flash-latest",
-      ])
-    ).filter(Boolean);
-
-    let stream = null;
-    let selectedModel = candidateModels[0];
-
-    for (const currentModel of candidateModels) {
-      try {
-        stream = await ai.models.generateContentStream({
-          model: currentModel,
-          contents,
-          config: systemInstruction ? { systemInstruction } : undefined,
-        });
-        selectedModel = currentModel;
-        break;
-      } catch (modelErr) {
-        console.warn(`Model ${currentModel} failed, trying next candidate:`, modelErr?.message || modelErr);
-        if (currentModel !== candidateModels[candidateModels.length - 1]) {
-          await new Promise((r) => setTimeout(r, 600));
-          continue;
-        }
-        throw modelErr;
-      }
-    }
-
-    // Await user message persistence
-    await userSavePromise;
+    let selectedModel = targetModel;
+    let streamSuccess = false;
+    let accumulatedText = "";
 
     let isConnected = true;
     req.on("close", () => {
       isConnected = false;
     });
 
-    let accumulatedText = "";
+    // 1. Attempt Google Gemini first if client was successfully initialized
+    if (ai) {
+      const candidateModels = Array.from(
+        new Set([
+          targetModel,
+          "gemini-3.8-flash",
+          "gemini-3.5-flash",
+          "gemini-3.7-flash",
+          "gemini-2.5-flash",
+          "gemini-flash-latest",
+        ])
+      ).filter(Boolean);
 
-    // Stream text chunks to client with resilience
-    try {
-      for await (const chunk of stream) {
+      selectedModel = candidateModels[0];
+
+      for (const currentModel of candidateModels) {
         if (!isConnected) break;
-        const text = chunk.text;
-        if (text) {
-          accumulatedText += text;
-          res.write(`data: ${JSON.stringify({ text })}\n\n`);
-        }
-      }
-    } catch (streamErr) {
-      console.warn("AI Stream interrupted:", streamErr?.message || streamErr);
-      if (!accumulatedText.trim() && isConnected) {
         try {
-          const fallbackRes = await ai.models.generateContent({
-            model: selectedModel,
+          const stream = await ai.models.generateContentStream({
+            model: currentModel,
             contents,
             config: systemInstruction ? { systemInstruction } : undefined,
           });
-          const fallbackText = fallbackRes.text || "";
-          if (fallbackText) {
-            accumulatedText = fallbackText;
-            res.write(`data: ${JSON.stringify({ text: fallbackText })}\n\n`);
+
+          for await (const chunk of stream) {
+            if (!isConnected) break;
+            const text = chunk.text;
+            if (text) {
+              accumulatedText += text;
+              res.write(`data: ${JSON.stringify({ text })}\n\n`);
+            }
           }
-        } catch (fallbackErr) {
-          console.error("Non-streaming fallback failed:", fallbackErr?.message || fallbackErr);
-          throw streamErr;
+
+          selectedModel = currentModel;
+          streamSuccess = true;
+          break;
+        } catch (modelErr) {
+          lastError = modelErr;
+          console.warn(`Model ${currentModel} failed:`, modelErr?.message || modelErr);
+          if (accumulatedText.trim().length > 0) {
+            break;
+          }
+          if (currentModel !== candidateModels[candidateModels.length - 1]) {
+            await new Promise((r) => setTimeout(r, 400));
+          }
         }
       }
+
+      // Non-streaming Gemini fallback if streaming didn't produce tokens
+      if (!streamSuccess && !accumulatedText.trim() && isConnected) {
+        for (const currentModel of candidateModels) {
+          try {
+            const fallbackRes = await ai.models.generateContent({
+              model: currentModel,
+              contents,
+              config: systemInstruction ? { systemInstruction } : undefined,
+            });
+            const fallbackText = fallbackRes.text || "";
+            if (fallbackText) {
+              accumulatedText = fallbackText;
+              selectedModel = currentModel;
+              res.write(`data: ${JSON.stringify({ text: fallbackText })}\n\n`);
+              streamSuccess = true;
+              break;
+            }
+          } catch (fallbackErr) {
+            console.warn(`Non-streaming fallback model ${currentModel} failed:`, fallbackErr?.message || fallbackErr);
+          }
+        }
+      }
+    }
+
+    // ── AUTOMATIC BACKUP: OPENAI (OPEN_API_KEY) ──
+    // If Google cannot answer, immediately switch to OpenAI backup to fulfill the user's request
+    if (!streamSuccess && !accumulatedText.trim() && isConnected && isOpenAIConfigured(userOpenAiKey)) {
+      console.log(
+        `[AI Fallback] Google Gemini unavailable (${lastError?.message || "unreachable"}). Rapidly switching to OpenAI backup (gpt-4o-mini)...`
+      );
+      try {
+        const backupResult = await streamOpenAIResponse({
+          messages,
+          prompt,
+          imageUrl,
+          systemInstruction,
+          customKey: userOpenAiKey,
+          model: "gpt-4o-mini",
+          onChunk: (delta) => {
+            if (!isConnected) return;
+            accumulatedText += delta;
+            res.write(`data: ${JSON.stringify({ text: delta })}\n\n`);
+          },
+        });
+        selectedModel = `${backupResult.model} (OpenAI Backup)`;
+        streamSuccess = true;
+      } catch (openAiStreamErr) {
+        console.warn("[OpenAI Backup] Streaming failed, attempting non-streaming fallback:", openAiStreamErr?.message || openAiStreamErr);
+        try {
+          const nonStreamRes = await generateOpenAIResponse({
+            messages,
+            prompt,
+            imageUrl,
+            systemInstruction,
+            customKey: userOpenAiKey,
+            model: "gpt-4o-mini",
+          });
+          if (nonStreamRes.text && isConnected) {
+            accumulatedText = nonStreamRes.text;
+            selectedModel = `${nonStreamRes.model} (OpenAI Backup)`;
+            res.write(`data: ${JSON.stringify({ text: nonStreamRes.text })}\n\n`);
+            streamSuccess = true;
+          }
+        } catch (openAiNonStreamErr) {
+          console.error("[OpenAI Backup] Non-streaming also failed:", openAiNonStreamErr?.message || openAiNonStreamErr);
+          const combinedMsg = `Google AI was unavailable (${lastError?.message || "error"}), and OpenAI backup also failed (${openAiNonStreamErr?.message || "error"}).`;
+          throw new Error(combinedMsg);
+        }
+      }
+    }
+
+    // Await user message persistence
+    await userSavePromise;
+
+    if (!streamSuccess && !accumulatedText.trim() && lastError) {
+      throw lastError;
     }
 
     if (isConnected) {

@@ -4,6 +4,11 @@ import Conversation from "../models/conversation.models.js";
 import Message from "../models/message.models.js";
 import User from "../models/user.models.js";
 import { verifyUsageAccess, incrementUsage } from "../utils/usageLimits.js";
+import {
+  isOpenAIConfigured,
+  streamOpenAIResponse,
+  generateOpenAIResponse,
+} from "../utils/openaiBackup.js";
 
 /**
  * Initializes GoogleGenAI client using server environment variable or user-provided key
@@ -267,20 +272,12 @@ const buildAlternatingContents = (messages, currentPrompt, currentImageUrl) => {
       .limit(20)
       .lean();
 
-    // Prepare contents for Gemini with strictly alternating turns
-    const ai = getAIClient(userApiKey);
-    const contents = buildAlternatingContents(recentMessages, prompt, imageUrl);
-
-    // Active Gemini model fallback chain (resilient against 503 high demand spikes)
-    const candidateModels = Array.from(
-      new Set([
-        targetModel,
-        "gemini-3.5-flash",
-        "gemini-3.5-flash-lite",
-        "gemini-flash-latest",
-        "gemini-3.8-flash",
-      ])
-    ).filter(Boolean);
+    // Resolve optional custom OpenAI backup API key from request headers or body
+    const userOpenAiKey =
+      req.headers["x-openai-api-key"] ||
+      req.headers["x-open-api-key"] ||
+      req.body.openAiApiKey ||
+      req.body.openApiKey;
 
     let isConnected = true;
     req.on("close", () => {
@@ -288,73 +285,146 @@ const buildAlternatingContents = (messages, currentPrompt, currentImageUrl) => {
     });
 
     let accumulatedText = "";
-    let selectedModel = candidateModels[0];
+    let selectedModel = targetModel;
     let streamSuccess = false;
     let lastError = null;
 
-    // 6. Stream tokens to client with automatic model fallback if experiencing high demand
-    for (const currentModel of candidateModels) {
-      if (!isConnected) break;
-      try {
-        const stream = await ai.models.generateContentStream({
-          model: currentModel,
-          contents,
-          config: systemInstruction ? { systemInstruction } : undefined,
-        });
-
-        for await (const chunk of stream) {
-          if (!isConnected) break;
-          const text = chunk.text;
-          if (text) {
-            accumulatedText += text;
-            res.write(`data: ${JSON.stringify({ text })}\n\n`);
-          }
-        }
-
-        selectedModel = currentModel;
-        streamSuccess = true;
-        break;
-      } catch (streamErr) {
-        lastError = streamErr;
-        console.warn(`Model ${currentModel} stream failed:`, streamErr?.message || streamErr);
-
-        // If we already sent tokens to client, stop rather than mixing model streams
-        if (accumulatedText.trim().length > 0) {
-          break;
-        }
-
-        // Delay briefly before trying next candidate
-        if (currentModel !== candidateModels[candidateModels.length - 1]) {
-          await new Promise((r) => setTimeout(r, 300));
-        }
-      }
+    // 6. Attempt Google Gemini first
+    let ai = null;
+    try {
+      ai = getAIClient(userApiKey);
+    } catch (clientErr) {
+      lastError = clientErr;
+      console.warn("[Google AI] Client initialization skipped:", clientErr.message);
     }
 
-    // Non-streaming fallback if streaming didn't produce tokens
-    if (!streamSuccess && !accumulatedText.trim() && isConnected) {
+    if (ai) {
+      // Prepare contents for Gemini with strictly alternating turns
+      const contents = buildAlternatingContents(recentMessages, prompt, imageUrl);
+
+      // Active Gemini model fallback chain (resilient against 503 high demand spikes)
+      const candidateModels = Array.from(
+        new Set([
+          targetModel,
+          "gemini-3.5-flash",
+          "gemini-3.5-flash-lite",
+          "gemini-flash-latest",
+          "gemini-3.8-flash",
+        ])
+      ).filter(Boolean);
+
+      selectedModel = candidateModels[0];
+
+      // Stream tokens to client with automatic model fallback
       for (const currentModel of candidateModels) {
+        if (!isConnected) break;
         try {
-          const fallbackRes = await ai.models.generateContent({
+          const stream = await ai.models.generateContentStream({
             model: currentModel,
             contents,
             config: systemInstruction ? { systemInstruction } : undefined,
           });
-          const fallbackText = fallbackRes.text || "";
-          if (fallbackText) {
-            accumulatedText = fallbackText;
-            selectedModel = currentModel;
-            res.write(`data: ${JSON.stringify({ text: fallbackText })}\n\n`);
-            streamSuccess = true;
+
+          for await (const chunk of stream) {
+            if (!isConnected) break;
+            const text = chunk.text;
+            if (text) {
+              accumulatedText += text;
+              res.write(`data: ${JSON.stringify({ text })}\n\n`);
+            }
+          }
+
+          selectedModel = currentModel;
+          streamSuccess = true;
+          break;
+        } catch (streamErr) {
+          lastError = streamErr;
+          console.warn(`Model ${currentModel} stream failed:`, streamErr?.message || streamErr);
+
+          // If tokens have already been delivered, stop rather than corrupting stream
+          if (accumulatedText.trim().length > 0) {
             break;
           }
-        } catch (fallbackErr) {
-          console.warn(`Non-streaming fallback model ${currentModel} failed:`, fallbackErr?.message || fallbackErr);
+
+          if (currentModel !== candidateModels[candidateModels.length - 1]) {
+            await new Promise((r) => setTimeout(r, 300));
+          }
         }
       }
 
-      if (!streamSuccess && lastError) {
-        throw lastError;
+      // Non-streaming Gemini fallback if streaming didn't produce tokens
+      if (!streamSuccess && !accumulatedText.trim() && isConnected) {
+        for (const currentModel of candidateModels) {
+          try {
+            const fallbackRes = await ai.models.generateContent({
+              model: currentModel,
+              contents,
+              config: systemInstruction ? { systemInstruction } : undefined,
+            });
+            const fallbackText = fallbackRes.text || "";
+            if (fallbackText) {
+              accumulatedText = fallbackText;
+              selectedModel = currentModel;
+              res.write(`data: ${JSON.stringify({ text: fallbackText })}\n\n`);
+              streamSuccess = true;
+              break;
+            }
+          } catch (fallbackErr) {
+            console.warn(`Non-streaming fallback model ${currentModel} failed:`, fallbackErr?.message || fallbackErr);
+          }
+        }
       }
+    }
+
+    // ── AUTOMATIC BACKUP: OPENAI (OPEN_API_KEY) ──
+    // If Google cannot answer, immediately switch to OpenAI backup to fulfill the user's request
+    if (!streamSuccess && !accumulatedText.trim() && isConnected && isOpenAIConfigured(userOpenAiKey)) {
+      console.log(
+        `[AI Fallback] Google Gemini unavailable (${lastError?.message || "unreachable"}). Rapidly switching to OpenAI backup (gpt-4o-mini)...`
+      );
+      try {
+        const backupResult = await streamOpenAIResponse({
+          messages: recentMessages,
+          prompt,
+          imageUrl,
+          systemInstruction,
+          customKey: userOpenAiKey,
+          model: "gpt-4o-mini",
+          onChunk: (delta) => {
+            if (!isConnected) return;
+            accumulatedText += delta;
+            res.write(`data: ${JSON.stringify({ text: delta })}\n\n`);
+          },
+        });
+        selectedModel = `${backupResult.model} (OpenAI Backup)`;
+        streamSuccess = true;
+      } catch (openAiStreamErr) {
+        console.warn("[OpenAI Backup] Streaming failed, attempting non-streaming fallback:", openAiStreamErr?.message || openAiStreamErr);
+        try {
+          const nonStreamRes = await generateOpenAIResponse({
+            messages: recentMessages,
+            prompt,
+            imageUrl,
+            systemInstruction,
+            customKey: userOpenAiKey,
+            model: "gpt-4o-mini",
+          });
+          if (nonStreamRes.text && isConnected) {
+            accumulatedText = nonStreamRes.text;
+            selectedModel = `${nonStreamRes.model} (OpenAI Backup)`;
+            res.write(`data: ${JSON.stringify({ text: nonStreamRes.text })}\n\n`);
+            streamSuccess = true;
+          }
+        } catch (openAiNonStreamErr) {
+          console.error("[OpenAI Backup] Non-streaming also failed:", openAiNonStreamErr?.message || openAiNonStreamErr);
+          const combinedMsg = `Google AI was unavailable (${lastError?.message || "error"}), and OpenAI backup also failed (${openAiNonStreamErr?.message || "error"}).`;
+          throw new Error(combinedMsg);
+        }
+      }
+    }
+
+    if (!streamSuccess && !accumulatedText.trim() && lastError) {
+      throw lastError;
     }
 
     // 7. Step C: On completion, persist AI assistant response & update conversation
