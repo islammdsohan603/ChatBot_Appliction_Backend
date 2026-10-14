@@ -103,13 +103,15 @@ const DEFAULT_PLANS = [
  */
 export const getPricingPlans = async (req, res) => {
   try {
-    let plans = await Pricing.find({ isActive: true }).sort({ priceMonthly: 1 });
-
-    if (!plans || plans.length === 0) {
-      await Pricing.insertMany(DEFAULT_PLANS);
-      plans = await Pricing.find({ isActive: true }).sort({ priceMonthly: 1 });
+    // Ensure all 3 default plans (Free, Pro, Enterprise) exist in the database
+    for (const defaultPlan of DEFAULT_PLANS) {
+      const exists = await Pricing.findOne({ slug: defaultPlan.slug });
+      if (!exists) {
+        await Pricing.create(defaultPlan);
+      }
     }
 
+    const plans = await Pricing.find({ isActive: true }).sort({ priceMonthly: 1 });
     return res.status(200).json({ success: true, plans });
   } catch (error) {
     console.error("Get Pricing Plans Error:", error);
