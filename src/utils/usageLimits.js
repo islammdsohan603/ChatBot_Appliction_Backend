@@ -12,9 +12,12 @@ export const TIER_LIMITS = {
     maxDailyMessages: 20,
     maxDailyImages: 5,
     allowedModels: [
-      "gemini-3.8-flash",
+      "gemini-flash-lite-latest",
+      "gemini-3.1-flash-lite",
+      "gemini-3.6-flash",
       "gemini-3.5-flash",
       "gemini-3.5-flash-lite",
+      "gemini-3.8-flash",
       "gemini-flash-latest",
     ],
     proOnlyModels: [
@@ -31,9 +34,9 @@ export const TIER_LIMITS = {
     maxPromptLength: 2500,
     features: [
       "20 AI messages / day",
-      "Standard Gemini Flash models",
+      "Ultra-fast Gemini Flash Lite models",
       "Up to 5 image attachments / day",
-      "Standard streaming speeds",
+      "High-speed streaming responses",
     ],
   },
   pro: {
@@ -43,9 +46,12 @@ export const TIER_LIMITS = {
     maxDailyMessages: 10000, // Unlimited practical usage
     maxDailyImages: 1000,
     allowedModels: [
-      "gemini-3.8-flash",
+      "gemini-flash-lite-latest",
+      "gemini-3.1-flash-lite",
+      "gemini-3.6-flash",
       "gemini-3.5-flash",
       "gemini-3.5-flash-lite",
+      "gemini-3.8-flash",
       "gemini-3.5-pro",
       "gemini-3.7-flash",
       "gemini-flash-latest",

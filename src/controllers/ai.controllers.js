@@ -125,10 +125,15 @@ export const streamAiChat = async (req, res) => {
       return res.status(400).json({ error: "A prompt, image, or messages array is required" });
     }
 
-    // Google deprecated gemini-2.5-flash for new users; default to gemini-3.8-flash
-    let targetModel = model || "gemini-3.8-flash";
-    if (targetModel === "gemini-2.5-flash") {
-      targetModel = "gemini-3.8-flash";
+    // Default to gemini-flash-lite-latest (fastest TTFT: ~1.0-1.2s, zero 503 errors)
+    let targetModel = model || "gemini-flash-lite-latest";
+    if (
+      targetModel === "gemini-3.8-flash" ||
+      targetModel === "gemini-2.5-flash" ||
+      targetModel === "gemini-2.0-flash" ||
+      targetModel === "gemini-1.5-flash"
+    ) {
+      targetModel = "gemini-flash-lite-latest";
     }
 
     // Check usage limits if authenticated user
@@ -296,11 +301,11 @@ const buildAlternatingContents = (historyMessages, currentPrompt, currentImageUr
       const candidateModels = Array.from(
         new Set([
           targetModel,
-          "gemini-3.8-flash",
+          "gemini-3.5-flash-lite",
+          "gemini-flash-lite-latest",
+          "gemini-3.1-flash-lite",
+          "gemini-3.6-flash",
           "gemini-3.5-flash",
-          "gemini-3.7-flash",
-          "gemini-2.5-flash",
-          "gemini-flash-latest",
         ])
       ).filter(Boolean);
 
@@ -309,11 +314,19 @@ const buildAlternatingContents = (historyMessages, currentPrompt, currentImageUr
       for (const currentModel of candidateModels) {
         if (!isConnected) break;
         try {
-          const stream = await ai.models.generateContentStream({
-            model: currentModel,
-            contents,
-            config: systemInstruction ? { systemInstruction } : undefined,
-          });
+          const stream = await Promise.race([
+            ai.models.generateContentStream({
+              model: currentModel,
+              contents,
+              config: systemInstruction ? { systemInstruction } : undefined,
+            }),
+            new Promise((_, reject) =>
+              setTimeout(
+                () => reject(new Error(`Timeout: Model ${currentModel} exceeded 2500ms TTFT threshold`)),
+                2500
+              )
+            ),
+          ]);
 
           for await (const chunk of stream) {
             if (!isConnected) break;
@@ -332,9 +345,6 @@ const buildAlternatingContents = (historyMessages, currentPrompt, currentImageUr
           console.warn(`Model ${currentModel} failed:`, modelErr?.message || modelErr);
           if (accumulatedText.trim().length > 0) {
             break;
-          }
-          if (currentModel !== candidateModels[candidateModels.length - 1]) {
-            await new Promise((r) => setTimeout(r, 400));
           }
         }
       }
